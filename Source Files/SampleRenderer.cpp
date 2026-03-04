@@ -29,7 +29,9 @@ struct __align__(OPTIX_SBT_RECORD_ALIGNMENT)HitgroupRecord {
 	//假数据
 	int objectID;
 };
-SampleRenderer::SampleRenderer()
+/*! constructor - performs all setup, including initializing
+  optix, creates module, pipeline, programs, SBT, etc. */
+SampleRenderer::SampleRenderer(const TriangleMesh& model)
 {
 	InitOptix();
 	
@@ -45,6 +47,8 @@ SampleRenderer::SampleRenderer()
 	createMissPrograms();
 	std::cout << "#osc: creating hitgroup programs ..." << std::endl;
 	createHitgroupPrograms();
+
+	launchParams.traversable = buildAccel(model);
 
 	std::cout << "#osc: setting up optix pipeline ..." << std::endl;
 	createPipeline();
@@ -64,13 +68,12 @@ void SampleRenderer::render()
 {
 	// sanity check: make sure we launch only after first resize is
 // already done:
-	if (launchParams.fbSize.x == 0) { return; }
+	if (launchParams.frame.size.x == 0) { return; }
 
 	launchParamsBuffer.upload(&launchParams, 1);
-	launchParams.frameID++;
 
 	OPTIX_CHECK(optixLaunch(pipeline,stream,launchParamsBuffer.d_pointer(),
-		launchParamsBuffer.sizeInBytes,&sbt,launchParams.fbSize.x,launchParams.fbSize.y,1));
+		launchParamsBuffer.sizeInBytes,&sbt,launchParams.frame.size.x,launchParams.frame.size.y,1));
 
 	//SYNC--确保帧已经在我们下载前渲染好
 	CUDA_SYNC_CHECK();
@@ -81,13 +84,24 @@ void SampleRenderer::resize(const gdt::vec2i& newSize)
 	if (newSize.x == 0 | newSize.y == 0) { return; }
 	colorBuffer.resize(newSize.x * newSize.y * sizeof(uint32_t));
 
-	launchParams.fbSize = newSize;
-	launchParams.colorBuffer = (uint32_t*)colorBuffer.d_ptr;
+	launchParams.frame.size = newSize;
+	launchParams.frame.colorBuffer = (uint32_t*)colorBuffer.d_ptr;
 }
 //下载buffer
 void SampleRenderer::downloadPixels(uint32_t h_pixels[])
 {
-	colorBuffer.download(h_pixels, launchParams.fbSize.x * launchParams.fbSize.y);
+	colorBuffer.download(h_pixels, launchParams.frame.size.x * launchParams.frame.size.y);
+}
+//设置相机参数
+void SampleRenderer::setCamera(const Camera& camera)
+{
+	lastSetCamera = camera;
+	launchParams.camera.position = camera.from;
+	launchParams.camera.direction = gdt::normalize(camera.at - camera.from);
+	const float cosFovy = 0.66f;
+	const float aspect = launchParams.frame.size.x / float(launchParams.frame.size.y);
+	launchParams.camera.horizontal = cosFovy * aspect * gdt::normalize(gdt::cross(launchParams.camera.direction, camera.up));
+	launchParams.camera.vertical = cosFovy * gdt::normalize(gdt::cross(launchParams.camera.horizontal, launchParams.camera.direction));
 }
 
 void SampleRenderer::InitOptix()
@@ -279,4 +293,127 @@ void SampleRenderer::buildSBT()
 	sbt.hitgroupRecordBase = hitgroupRecordsBuffer.d_pointer();
 	sbt.hitgroupRecordStrideInBytes = sizeof(HitgroupRecord);
 	sbt.hitgroupRecordCount = hitgroupRecords.size();
+}
+//构建BVH树
+OptixTraversableHandle SampleRenderer::buildAccel(const TriangleMesh& model)
+{
+	//给设备上传模型
+	vertexBuffer.alloc_and_upload(model.vertex);
+	indexBuffer.alloc_and_upload(model.index);
+
+	OptixTraversableHandle asHandle{ 0 };
+	//-------------------------------------------
+	//输入三角形
+	//-------------------------------------------
+	OptixBuildInput triangleInput = {};
+	triangleInput.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+
+	// create local variables, because we need a *pointer* to the
+    // device pointers
+	CUdeviceptr d_vertices = vertexBuffer.d_pointer();
+	CUdeviceptr d_indices = indexBuffer.d_pointer();
+
+	triangleInput.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+	triangleInput.triangleArray.vertexStrideInBytes = sizeof(gdt::vec3f);
+	triangleInput.triangleArray.numVertices = (int)model.vertex.size();
+	triangleInput.triangleArray.vertexBuffers = &d_vertices;
+
+	triangleInput.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+	triangleInput.triangleArray.indexStrideInBytes = sizeof(gdt::vec3i);
+	triangleInput.triangleArray.numIndexTriplets = (int)model.index.size();
+	triangleInput.triangleArray.indexBuffer = d_indices;
+
+	uint32_t triangleInputFlags[1] = { 0 };
+	//我们有一个SBT入口，但是没有材质
+	triangleInput.triangleArray.flags = triangleInputFlags;
+	triangleInput.triangleArray.numSbtRecords = 1;
+	triangleInput.triangleArray.sbtIndexOffsetBuffer = 0;
+	triangleInput.triangleArray.sbtIndexOffsetSizeInBytes = 0;
+	triangleInput.triangleArray.sbtIndexOffsetStrideInBytes = 0;
+
+	//-----------------------------------------------
+	//设置BLAS
+	//---------------------------------------------
+	OptixAccelBuildOptions accelOptions = {};
+	accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE | OPTIX_BUILD_FLAG_ALLOW_COMPACTION;
+	accelOptions.motionOptions.numKeys = 1;
+	accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+
+	OptixAccelBufferSizes blasBufferSizes;
+	OPTIX_CHECK(optixAccelComputeMemoryUsage(optixContext, &accelOptions, &triangleInput, 1, &blasBufferSizes));
+	//-----------------------------------
+	//prepare compaction(打包)
+	//-------------------------------------
+	CUDABuffer compactedSizeBuffer;
+	compactedSizeBuffer.alloc(sizeof(uint64_t));
+
+	OptixAccelEmitDesc emitDesc;
+	emitDesc.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
+	emitDesc.result = compactedSizeBuffer.d_pointer();
+
+	//-------------------------------
+	//执行主步骤
+	//------------------------------
+	CUDABuffer tempBuffer;
+	tempBuffer.alloc(blasBufferSizes.tempSizeInBytes);
+
+	CUDABuffer outputBuffer;
+	outputBuffer.alloc(blasBufferSizes.outputSizeInBytes);
+
+	OPTIX_CHECK(optixAccelBuild(optixContext, 0/*stream*/, &accelOptions, &triangleInput,
+		1, tempBuffer.d_pointer(), tempBuffer.sizeInBytes, outputBuffer.d_pointer(), outputBuffer.sizeInBytes, &asHandle, &emitDesc, 1));
+	CUDA_SYNC_CHECK();
+
+	//-----------------------------------------------------
+	//perform 打包
+	//---------------------------------------------
+	uint64_t compactedSize;
+	compactedSizeBuffer.download(&compactedSize, 1);
+
+	asBuffer.alloc(compactedSize);
+	OPTIX_CHECK(optixAccelCompact(optixContext, 0, asHandle, asBuffer.d_pointer(), asBuffer.sizeInBytes, &asHandle));
+
+	CUDA_SYNC_CHECK();
+	//------------------------------------------------------------------------
+	//释放
+	//----------------------------------------
+	outputBuffer.free();
+	tempBuffer.free();
+	compactedSizeBuffer.free();
+
+	return asHandle;
+}
+
+void TriangleMesh::addUnitCube(const gdt::affine3f& xfm)
+{
+	int firstVertexID = (int)vertex.size();
+	vertex.push_back(gdt::xfmPoint(xfm, gdt::vec3f(0.f, 0.f, 0.f)));
+	vertex.push_back(gdt::xfmPoint(xfm, gdt::vec3f(1.f, 0.f, 0.f)));
+	vertex.push_back(gdt::xfmPoint(xfm, gdt::vec3f(0.f, 1.f, 0.f)));
+	vertex.push_back(gdt::xfmPoint(xfm, gdt::vec3f(1.f, 1.f, 0.f)));
+	vertex.push_back(gdt::xfmPoint(xfm, gdt::vec3f(0.f, 0.f, 1.f)));
+	vertex.push_back(gdt::xfmPoint(xfm, gdt::vec3f(1.f, 0.f, 1.f)));
+	vertex.push_back(gdt::xfmPoint(xfm, gdt::vec3f(0.f, 1.f, 1.f)));
+	vertex.push_back(gdt::xfmPoint(xfm, gdt::vec3f(1.f, 1.f, 1.f)));
+
+	int indices[] = { 0,1,3, 2,0,3,
+				 5,7,6, 5,6,4,
+				 0,4,5, 0,5,1,
+				 2,3,7, 2,7,6,
+				 1,5,7, 1,7,3,
+				 4,0,2, 4,2,6
+	};
+	for (int i = 0; i < 12; i++) {
+		index.push_back(firstVertexID + gdt::vec3i(indices[3 * i + 0], indices[3 * i + 1], indices[3 * i + 2]));
+	}
+}
+
+void TriangleMesh::addCube(const gdt::vec3f& center, const gdt::vec3f& size)
+{
+	gdt::affine3f xfm;
+	xfm.p = center - 0.5f * size;
+	xfm.l.vx = gdt::vec3f(size.x, 0.f, 0.f);
+	xfm.l.vy = gdt::vec3f(0.f, size.y, 0.f);
+	xfm.l.vz = gdt::vec3f(0.f, 0.f, size.z);
+	addUnitCube(xfm);
 }

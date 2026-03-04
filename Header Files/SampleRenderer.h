@@ -2,16 +2,33 @@
 #include "../Header Files/LuanchParams.h"
 #include "../Header Files/optix7.h"
 #include "../Header Files/CUDABuffer.h"
+#include "gdt/math/AffineSpace.h"
 #include <vector>
+struct Camera {
+	gdt::vec3f from;
+	gdt::vec3f at;
+	gdt::vec3f up;
+};
+struct TriangleMesh
+{
+	void addUnitCube(const gdt::affine3f& xfm);
+
+	void addCube(const gdt::vec3f& center, const gdt::vec3f& size);
+
+	std::vector<gdt::vec3f> vertex;
+	std::vector<gdt::vec3i> index;
+};
 class SampleRenderer {
 public:
-	SampleRenderer();
+	SampleRenderer(const TriangleMesh& model);
 	//画一帧
 	void render();
 	//定义帧缓存
 	void resize(const gdt::vec2i& newSize);
 	//现在渲染的颜色缓存
 	void downloadPixels(uint32_t h_pixels[]);
+	/*! set camera to render with */
+	void setCamera(const Camera& camera);
 protected:
 	//初始化Optix和检查1错误
 	void InitOptix();
@@ -31,6 +48,9 @@ protected:
 	void createPipeline();
 	//构建SBT
 	void buildSBT();
+
+	/*! build an acceleration structure for the given triangle mesh */
+	OptixTraversableHandle buildAccel(const TriangleMesh& model);
 protected:
 	CUcontext cudaContext;
 	CUstream stream;
@@ -59,4 +79,13 @@ protected:
 	CUDABuffer launchParamsBuffer;
 
 	CUDABuffer colorBuffer;
+	//我们要渲染的相机
+	Camera lastSetCamera;
+
+	//我们要渲染的模型
+	const TriangleMesh model;
+	CUDABuffer vertexBuffer;
+	CUDABuffer indexBuffer;
+	//存放(final,compacted)加速结构
+	CUDABuffer asBuffer;
 };
